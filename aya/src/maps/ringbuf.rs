@@ -208,7 +208,7 @@ impl<T: DerefMut<Target = Map>> Ring<T> {
         let mut count = 0u64;
         let mut got_new;
         let mut len;
-        let len_ptr = AtomicPtr::<u32>::new(ptr::null_mut());
+        let mut len_ptr;
 
         let mut consumer_pos = unsafe { *self.consumer_pos.load(Ordering::SeqCst) };
         loop {
@@ -216,16 +216,9 @@ impl<T: DerefMut<Target = Map>> Ring<T> {
 
             let produer_pos = unsafe { *self.producer_pos.load(Ordering::SeqCst) };
             while consumer_pos < produer_pos {
-                len_ptr.store(
-                    unsafe {
-                        self.data
-                            .load(Ordering::SeqCst)
-                            .add(consumer_pos as usize & self.mask)
-                            as *mut _
-                    },
-                    Ordering::SeqCst,
-                );
-                len = unsafe { *len_ptr.load(Ordering::SeqCst) };
+                len_ptr = self.data.load(Ordering::SeqCst) as *mut u32;
+                len_ptr = unsafe { len_ptr.add(consumer_pos as usize & self.mask) };
+                len = unsafe { *len_ptr };
 
                 // The sample has not been comitted yet, so bail
                 if (len as usize & BPF_RINGBUF_BUSY_BIT as usize) != 0 {
@@ -238,11 +231,7 @@ impl<T: DerefMut<Target = Map>> Ring<T> {
 
                 if (len & BPF_RINGBUF_DISCARD_BIT) == 0 {
                     // Coerce the sample into a &[u8]
-                    let sample_ptr = unsafe {
-                        len_ptr
-                            .load(Ordering::SeqCst)
-                            .add(BPF_RINGBUF_HDR_SZ as usize)
-                    };
+                    let sample_ptr = unsafe { *len_ptr.add(BPF_RINGBUF_HDR_SZ as usize) };
                     let sample =
                         unsafe { std::slice::from_raw_parts(sample_ptr as *mut u8, len as usize) };
 
