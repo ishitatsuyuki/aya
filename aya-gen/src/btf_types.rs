@@ -3,7 +3,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
-    str::from_utf8,
+    str::{from_utf8, FromStr},
 };
 
 use tempfile::tempdir;
@@ -38,7 +38,11 @@ pub enum InputFile {
     Header(PathBuf),
 }
 
-pub fn generate<T: AsRef<str>>(input_file: InputFile, types: &[T]) -> Result<String, Error> {
+pub fn generate<T: AsRef<str>>(
+    input_file: InputFile,
+    types: &[T],
+    bindgen_args: &[T],
+) -> Result<String, Error> {
     let mut bindgen = bindgen::bpf_builder();
 
     let (c_header, name) = match input_file {
@@ -60,19 +64,24 @@ pub fn generate<T: AsRef<str>>(input_file: InputFile, types: &[T]) -> Result<Str
     let _ = file.write(c_header.as_bytes()).unwrap();
 
     let flags = bindgen.command_line_flags();
+    let bindgen_args: Vec<String> = bindgen_args
+        .iter()
+        .map(|s| String::from_str(s.as_ref()).unwrap())
+        .collect();
 
     // TODO: check proper logging; it seems useful to see what command is
     // launched but we can't disturb the normal output of the aya-gen tool
-    println!(
-        "Launching bindgen {} {}",
+    eprintln!(
+        "Launching bindgen {} {} {}",
         file_path.to_str().unwrap(),
-        flags.join(" ")
+        flags.join(" "),
+        bindgen_args.join(" ")
     );
 
     let output = Command::new("bindgen")
         .arg(file_path)
-        .args(flags)
-        // TODO: pass additional arguments after --
+        .args(&flags)
+        .args(bindgen_args)
         .output()
         .map_err(Error::Bindgen)?;
 
