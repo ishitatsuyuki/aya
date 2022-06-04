@@ -1,4 +1,4 @@
-use aya_gen::btf_types::{generate, InputFile};
+use aya_gen::generate::{generate, InputFile};
 
 use std::{path::PathBuf, process::exit};
 
