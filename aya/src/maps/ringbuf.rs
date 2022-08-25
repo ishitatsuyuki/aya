@@ -7,10 +7,10 @@
 use std::{
     convert::TryFrom,
     io,
-    ops::DerefMut,
+    ops::{Deref, DerefMut},
     os::unix::prelude::AsRawFd,
     ptr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering},
 };
 
 use libc::{munmap, sysconf, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, _SC_PAGESIZE};
@@ -124,9 +124,12 @@ pub enum RingBufferError {
 pub struct RingBuf<T: DerefMut<Target = Map>> {
     _map: T,
     map_fd: i32,
-    data_ptr: *mut u8,
-    consumer_pos_ptr: *mut AtomicUsize,
-    producer_pos_ptr: *mut AtomicUsize,
+    data_ptr: *const u8,
+    consumer_pos_ptr: *const AtomicUsize,
+    producer_pos_ptr: *const AtomicUsize,
+    // A copy of `*producer_pos_ptr` to reduce cache line contention.
+    // Might be stale, and should be refreshed once the consumer position has caught up.
+    producer_pos_cache: usize,
     page_size: usize,
     mask: usize,
 }
@@ -200,6 +203,7 @@ impl<T: DerefMut<Target = Map>> RingBuf<T> {
             data_ptr: unsafe { (producer_pages as *mut u8).add(page_size) },
             consumer_pos_ptr: consumer_page as *mut _,
             producer_pos_ptr: producer_pages as *mut _,
+            producer_pos_cache: 0,
             page_size,
             mask,
         })
@@ -287,6 +291,63 @@ impl<T: DerefMut<Target = Map>> RingBuf<T> {
 
         Ok(())
     }
+
+    ///
+    pub fn next(&mut self) -> Option<RingBufItem<T>> {
+        // If `cb()` is true, try again after executing a memory barrier.
+        // Returns true if both invocations are true, otherwise false.
+        fn with_mb_retry(mut cb: impl FnMut() -> bool) -> bool {
+            cb() && {
+                fence(Ordering::SeqCst);
+                cb()
+            }
+        }
+
+        loop {
+            let consumer_pos = unsafe { (*self.consumer_pos_ptr).load(Ordering::Relaxed) };
+            if consumer_pos == self.producer_pos_cache {
+                if with_mb_retry(|| {
+                    self.producer_pos_cache =
+                        unsafe { (*self.producer_pos_ptr).load(Ordering::Acquire) };
+                    consumer_pos == self.producer_pos_cache
+                }) {
+                    return None;
+                }
+            }
+
+            let sample_head = unsafe { self.data_ptr.add(consumer_pos as usize & self.mask) };
+            let mut len_and_flags = 0; // Dummy value
+
+            if with_mb_retry(|| {
+                len_and_flags =
+                    unsafe { (*(sample_head as *mut AtomicU32)).load(Ordering::Acquire) };
+                (len_and_flags & BPF_RINGBUF_BUSY_BIT) != 0
+            }) {
+                return None;
+            } else if (len_and_flags & BPF_RINGBUF_DISCARD_BIT) != 0 {
+                self.consume();
+            } else {
+                break;
+            }
+        }
+
+        Some(RingBufItem(self))
+    }
+
+    fn consume(&mut self) {
+        let consumer_pos = unsafe { (*self.consumer_pos_ptr).load(Ordering::Relaxed) };
+        let sample_head = unsafe { self.data_ptr.add(consumer_pos as usize & self.mask) };
+        let len_and_flags = unsafe { (*(sample_head as *mut AtomicU32)).load(Ordering::Relaxed) };
+        assert_eq!(
+            (len_and_flags & (BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT)),
+            0
+        );
+
+        let new_consumer_pos = consumer_pos + roundup_len(len_and_flags) as usize;
+        unsafe {
+            (*self.consumer_pos_ptr).store(new_consumer_pos, Ordering::Release);
+        }
+    }
 }
 
 impl<T: DerefMut<Target = Map>> Drop for RingBuf<T> {
@@ -321,6 +382,33 @@ impl TryFrom<MapRefMut> for RingBuf<MapRefMut> {
 
     fn try_from(a: MapRefMut) -> Result<RingBuf<MapRefMut>, RingBufferError> {
         RingBuf::new(a)
+    }
+}
+
+///
+pub struct RingBufItem<'a, T: DerefMut<Target = Map>>(&'a mut RingBuf<T>);
+
+impl<'a, T: DerefMut<Target = Map>> Deref for RingBufItem<'a, T> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        let consumer_pos = unsafe { (*self.0.consumer_pos_ptr).load(Ordering::Relaxed) };
+        let sample_head = unsafe { self.0.data_ptr.add(consumer_pos as usize & self.0.mask) };
+        let len_and_flags = unsafe { (*(sample_head as *mut AtomicU32)).load(Ordering::Relaxed) };
+        assert_eq!(
+            (len_and_flags & (BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT)),
+            0
+        );
+
+        // Coerce the sample into a &[u8]
+        let sample_ptr = unsafe { sample_head.add(BPF_RINGBUF_HDR_SZ as usize) };
+        unsafe { std::slice::from_raw_parts(sample_ptr as *const u8, len_and_flags as usize) }
+    }
+}
+
+impl<'a, T: DerefMut<Target = Map>> Drop for RingBufItem<'a, T> {
+    fn drop(&mut self) {
+        self.0.consume();
     }
 }
 
